@@ -1,0 +1,9 @@
+# DO NOT INSTALL THIS FILE DIRECTLY. It lists direct dependencies with version
+# ranges and is the input to the lock file. Install the pinned lambda_functions/requirements.txt instead,
+# which pins every package, including transitive ones. To change dependencies,
+# edit this file and regenerate the lock (README, "Update dependencies").
+strands-agents[otel]==1.20.0
+boto3==1.43.106
+pandas==2.2.3
+aws-opentelemetry-distro==0.20.0
+pydantic==2.13.5

@@ -1,0 +1,6 @@
+# DO NOT INSTALL THIS FILE DIRECTLY. It lists direct dependencies with version
+# ranges and is the input to the lock file. Install the pinned requirements.txt instead,
+# which pins every package, including transitive ones. To change dependencies,
+# edit this file and regenerate the lock (README, "Update dependencies").
+-r lambda_functions/requirements.in
+streamlit==1.64.0

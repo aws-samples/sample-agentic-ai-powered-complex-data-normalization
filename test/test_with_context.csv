@@ -1,0 +1,4 @@
+charge_text,state,county,charge_code,offense_type,date_of_offense
+DWI 2nd Offense,TX,Travis County,49.04,Misdemeanor,2025-12-15
+POSS CS PG 1 <1G,TX,Harris County,481.115,Felony,2025-11-20
+Aggravated Assault,CA,Los Angeles County,245,Felony,2025-10-05

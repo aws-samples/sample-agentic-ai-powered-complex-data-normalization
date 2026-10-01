@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environments
+agentcoreenv/
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment Variables
+.env
+.env.local
+data/env.json
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Results and Logs
+strands_results_*.json
+*.log
+
+# Streamlit
+.streamlit/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Sensitive / input data files (never commit real charge data)
+data/*.csv
+data/*.pdf
+data/*.xlsx
+
+# IDE working directories
+.kiro/
+
+# Build + local env artifacts
+.aws-sam/
+.test_venv/
+
+# Test files
+test/*.csv
+test/*.json
+test/*.sh
+
+# Exception: Allow specific test file
+!test/test_with_context.csv
+
+# Secrets
+*.pem
+*.key
+*_key.json
+
+# Build artifacts
+.samignore
+
+# local test venv (not committed)
+.test_venv/
+
+# Local narrative drafts (blogs publish via AWS blog pipeline, not the repo)
+*.docx
+
+# Stale pre-edit blog draft (published version lives on the AWS blog)
+blog-post-*.md
+
+# Linter cache
+.ruff_cache/
+.pytest_cache/
+
+# Browser automation working files
+.playwright-cli/

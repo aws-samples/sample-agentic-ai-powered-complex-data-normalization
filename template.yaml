@@ -1,0 +1,877 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Criminal Charge Classification - Lambda-Only Architecture
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Environment name
+
+  Taxonomy:
+    Type: String
+    Default: law_enforcement
+    AllowedValues:
+      - law_enforcement
+    Description: >-
+      Classification profile (see lambda_functions/taxonomies/). Add your own
+      profile module and list it here to classify a different domain.
+
+  ReviewThreshold:
+    Type: String
+    Default: '0.60'
+    AllowedPattern: '^(0(\.[0-9]+)?|1(\.0+)?)$'
+    Description: Results with confidence below this value are flagged needs_review.
+
+  MonthlyCostBudgetUsd:
+    Type: Number
+    Default: 500
+    Description: Monthly cost ceiling (USD) for the optional AWS Budgets alert
+
+  AdotLayerArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional override for the AWS Distro for OpenTelemetry (ADOT) Python Lambda
+      layer ARN. Leave blank to use the default layer in the deployment Region.
+      Current ARNs: https://aws-otel.github.io/docs/getting-started/lambda/lambda-python
+
+  BudgetAlertEmail:
+    Type: String
+    Default: ''
+    Description: Email to notify on budget threshold breach (leave blank to skip budget)
+
+Conditions:
+  # Only create the budget when an alert email is supplied.
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, '']]
+  HasAdotLayerOverride: !Not [!Equals [!Ref AdotLayerArn, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    # Encrypt environment variables at rest with the stack's customer managed key.
+    KmsKeyArn: !GetAtt EncryptionKey.Arn
+    Timeout: 900
+    MemorySize: 2048
+    Tags:
+      Project: CriminalChargeClassifier
+      Environment: !Ref Environment
+      ManagedBy: SAM
+
+Resources:
+  # Web Search on Amazon Bedrock AgentCore. The Web Search tool is a managed
+  # connector on an AgentCore Gateway. The gateway authenticates callers with
+  # IAM (SigV4) and uses its service role to call the Web Search backend, so no
+  # search API key is stored anywhere and queries are served within AWS.
+  WebSearchGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: WebSearchConnector
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeWebSearch
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeWebSearch
+                # AWS-owned tool ARN (account "aws").
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1'
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                # Scoped by account and Region; the gateway ARN is not known until
+                # the gateway exists, and the gateway needs this role first.
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*'
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebSearchGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub '${AWS::StackName}-search'
+      Description: Web search for the classification agent
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt WebSearchGatewayRole.Arn
+      Tags:
+        Project: CriminalChargeClassifier
+        Environment: !Ref Environment
+
+  WebSearchTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !Ref WebSearchGateway
+      Name: web-search-tool
+      Description: Web Search tool on Amazon Bedrock AgentCore
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source:
+              ConnectorId: web-search
+            Configurations:
+              - Name: WebSearch
+                ParameterValues: {}
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # Bedrock Guardrail - managed, model-side defense-in-depth. PROMPT_ATTACK
+  # content filter is the primary control against injected instructions in
+  # charge_text; PII entity anonymization backstops log/data leakage.
+  # This is a declarative AWS control, not custom code.
+  ChargeGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub '${AWS::StackName}-guardrail'
+      Description: Prompt-injection and PII protection for charge classification
+      BlockedInputMessaging: 'Input blocked by content policy.'
+      BlockedOutputsMessaging: 'Output blocked by content policy.'
+      ContentPolicyConfig:
+        FiltersConfig:
+          # PROMPT_ATTACK at LOW: catches high-confidence injection attempts
+          # without false-positiving on our own instruction-shaped classification
+          # prompt (Strands sends the full prompt untagged, so HIGH flagged the
+          # legitimate "Classify this charge" instructions as an attack). Per AWS
+          # guidance, start LOW and tune up. Code-side defenses (sanitization,
+          # <charge_data> delimiters, strict schema + NIBRS allowlist) are the
+          # primary control; the guardrail is defense-in-depth.
+          - Type: PROMPT_ATTACK
+            InputStrength: LOW
+            OutputStrength: NONE   # PROMPT_ATTACK only supports input-side evaluation
+            InputAction: BLOCK
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          # Anonymize sensitive identifiers in the input before it reaches the
+          # model. InputAction and InputEnabled must be set explicitly: with
+          # only the legacy Action field, ApplyGuardrail does not evaluate PII
+          # on INPUT. Output evaluation is off because only input is screened.
+          - Type: NAME
+            Action: ANONYMIZE
+            InputAction: ANONYMIZE
+            InputEnabled: true
+            OutputEnabled: false
+          - Type: ADDRESS
+            Action: ANONYMIZE
+            InputAction: ANONYMIZE
+            InputEnabled: true
+            OutputEnabled: false
+          - Type: US_SOCIAL_SECURITY_NUMBER
+            Action: ANONYMIZE
+            InputAction: ANONYMIZE
+            InputEnabled: true
+            OutputEnabled: false
+          - Type: DRIVER_ID
+            Action: ANONYMIZE
+            InputAction: ANONYMIZE
+            InputEnabled: true
+            OutputEnabled: false
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+
+  # A new guardrail version is published only when this resource's properties
+  # change. After editing ChargeGuardrail, update Description so the processor
+  # picks up the new configuration.
+  ChargeGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt ChargeGuardrail.GuardrailId
+      Description: Published version for the processor Lambda (input PII masking)
+
+  # KMS Key for encryption
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for charge classification data
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # AWS default key policy statement: lets IAM policies in this account
+          # grant access to the key (the function roles rely on it for
+          # kms:Decrypt and kms:GenerateDataKey). For production, consider
+          # replacing it with separate key-administrator and key-user statements
+          # scoped to specific roles; see "Default key policy" in the AWS KMS
+          # Developer Guide.
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'   # AWS default key policy; restrict to scoped admin/user statements for production
+            Resource: '*'
+          # Lambda functions use this key through their execution roles (see
+          # the KMS statements in each function's policy), so no Lambda service
+          # principal statement is needed here. In a key policy, Resource '*'
+          # refers to this key only.
+          # AWS-documented pattern for encrypting log groups, scoped to this
+          # account's log groups by the encryption context condition.
+          - Sid: Allow CloudWatch Logs to use the key
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-encryption'
+      TargetKeyId: !Ref EncryptionKey
+
+  # S3 Bucket for CSV uploads
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-input-${AWS::AccountId}'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: input/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFiles
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS Queue for charge batches
+  ChargeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-charges'
+      VisibilityTimeout: 960  # 16 minutes (Lambda timeout + buffer)
+      MessageRetentionPeriod: 86400  # 24 hours
+      # Encrypt queue contents (charge batches) with the customer-managed KMS key
+      KmsMasterKeyId: !Ref EncryptionKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # Upload events the splitter failed to process after Lambda's async retries.
+  SplitterDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-splitter-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # DynamoDB Table for results
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-results'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: charge_id
+          AttributeType: S
+        - AttributeName: processing_timestamp
+          AttributeType: S
+        - AttributeName: code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: charge_id
+          KeyType: HASH
+        - AttributeName: processing_timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: code-index
+          KeySchema:
+            - AttributeName: code
+              KeyType: HASH
+            - AttributeName: processing_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: Sensitive
+
+  # Splitter Lambda - Reads CSV and creates batches
+  SplitterFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python3.12
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: Calls AWS service endpoints over TLS only; no private resources to reach, so no VPC is required for this sample.
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-splitter'
+      CodeUri: lambda_functions/
+      Handler: lambda_splitter.lambda_handler
+      Timeout: 300  # 5 minutes
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 5  # limits concurrent file processing
+      # EventBridge invokes the splitter asynchronously; keep events that fail
+      # after retries instead of dropping them.
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt SplitterDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ChargeQueue
+          TAXONOMY: !Ref Taxonomy
+          # Batch Configuration
+          BATCH_SIZE: '25'
+          # Cost controls: the EventBridge rule filters by file size and key
+          # prefix; the splitter caps the row count per upload.
+          MAX_ROWS: '100000'           # 100K charges per upload
+          ALLOWED_PREFIX: 'inbox/'
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref InputBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ChargeQueue.QueueName
+        - Statement:
+            - Sid: KMSForEncryptedSqs
+              Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey   # required to send to the KMS-encrypted ChargeQueue
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        S3Upload:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref InputBucket
+                object:
+                  # Only fire on objects under the ingest prefix, not any object.
+                  key:
+                    - prefix: 'inbox/'
+                  # Native size guard: never even invoke the Splitter for an object
+                  # larger than 50 MB. EventBridge does the numeric compare, so no
+                  # Lambda cold-start or HeadObject call is spent on oversized files.
+                  size:
+                    - numeric:
+                        - "<="
+                        - 52428800
+
+  # Processor Lambda - Classifies charges
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python3.12
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: Invoked synchronously by the SQS event source; failed batches go to the SQS queue's dead-letter queue (DeadLetterQueue) after 3 receives.
+          - id: CKV_AWS_117
+            comment: Calls AWS service endpoints over TLS only; no private resources to reach, so no VPC is required for this sample.
+      BuildProperties:
+        Exclude:
+          - test/**
+          - docs/**
+          - data/**
+          - strands_agent_classifier.py
+          - streamlit_ui.py
+          - .env.example
+          - env.json
+          - "*.md"
+          - "*.csv"
+          - "*.pdf"
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processor'
+      CodeUri: lambda_functions/
+      Handler: lambda_processor.lambda_handler
+      Timeout: 900  # 15 minutes
+      MemorySize: 2048
+      ReservedConcurrentExecutions: 100
+      Description: "Classifies criminal charges using Strands agent - v4 with ADOT Layer"
+      # ADOT Lambda Layer for automatic OTEL instrumentation
+      Layers:
+        - !If
+          - HasAdotLayerOverride
+          - !Ref AdotLayerArn
+          - !Sub 'arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:2'
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ResultsTable
+          TAXONOMY: !Ref Taxonomy
+          REVIEW_THRESHOLD: !Ref ReviewThreshold
+          WEB_SEARCH_GATEWAY_URL: !GetAtt WebSearchGateway.GatewayUrl
+          # Bedrock Guardrail - evaluated by the ApplyGuardrail input pre-check
+          GUARDRAIL_ID: !GetAtt ChargeGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt ChargeGuardrailVersion.Version
+          # Model Configuration (JSON)
+          MODEL_CONFIG: '{"model_id":"us.anthropic.claude-sonnet-5","max_tokens":8000}'
+          # Search Configuration (JSON)
+          SEARCH_CONFIG: '{"max_results":3,"content_length":500}'
+          # Batch Configuration
+          BATCH_SIZE: '25'
+          # OTEL Configuration - Strands native OTEL support
+          AGENT_OBSERVABILITY_ENABLED: 'true'
+          AWS_LAMBDA_EXEC_WRAPPER: '/opt/otel-instrument'
+          OTEL_PYTHON_DISTRO: 'aws_distro'
+          OTEL_PYTHON_CONFIGURATOR: 'aws_configurator'
+          OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf'
+          OTEL_TRACES_EXPORTER: 'otlp'
+          OTEL_METRICS_EXPORTER: 'none'
+          OTEL_LOGS_EXPORTER: 'none'
+          OTEL_PROPAGATORS: 'tracecontext,baggage,xray'
+          OTEL_RESOURCE_ATTRIBUTES: !Sub 'service.name=charge-classifier,aws.log.group.names=/aws/lambda/${AWS::StackName}-processor'
+          OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318'
+          OTEL_EXPORTER_OTLP_TRACES_HEADERS: !Sub 'x-aws-log-group=/aws/spans,x-aws-log-stream=default'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResultsTable
+        - Statement:
+            # Bedrock Model Invocation - Allow all Anthropic models (cross-region support)
+            - Sid: BedrockInvokeAnthropicModels
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource:
+                # Foundation models (direct access)
+                - 'arn:aws:bedrock:*::foundation-model/anthropic.claude-*'
+                # Cross-region inference profiles (us. prefix)
+                - 'arn:aws:bedrock:*::inference-profile/us.anthropic.claude-*'
+                # Account-specific inference profiles
+                - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.anthropic.claude-*'
+            
+            # NOTE: aws-marketplace:Subscribe was removed. Per AWS
+            # docs, Marketplace subscription permissions are only needed on the
+            # FIRST invocation of a serverless model in an account; once the
+            # Anthropic models are enabled (done at initial deploy), all callers
+            # invoke without Marketplace permissions. aws-marketplace:Subscribe
+            # cannot be resource-scoped (Resource must be "*"), so the least-
+            # privilege choice is to not grant it at steady state. If deploying to
+            # a fresh account, enable the models once manually (or temporarily add
+            # this permission for the first run), then redeploy without it.
+
+            # Guardrail evaluation for prompt-injection/PII protection.
+            - Sid: BedrockApplyGuardrail
+              Effect: Allow
+              Action:
+                - bedrock:ApplyGuardrail
+              Resource: !GetAtt ChargeGuardrail.GuardrailArn
+
+            # Call the Web Search tool through the stack's AgentCore Gateway.
+            - Sid: InvokeWebSearchGateway
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:InvokeGateway
+              Resource: !GetAtt WebSearchGateway.GatewayArn
+            
+            - Sid: KMSForEncryptedResources
+              Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey   # receive from KMS-encrypted SQS + write to KMS-encrypted DynamoDB
+              Resource: !GetAtt EncryptionKey.Arn
+
+            - Sid: CloudWatchLogs
+              Effect: Allow
+              Action:
+                - logs:PutLogEvents
+                - logs:CreateLogStream
+                - logs:CreateLogGroup
+              Resource: 
+                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/spans:*'
+                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*'
+            
+            - Sid: XRayAccess
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: '*'
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ChargeQueue.Arn
+            BatchSize: 1  # Process 1 SQS message at a time (contains 50 charges)
+
+  # Output S3 Bucket
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-output-${AWS::AccountId}'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: output/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: Sensitive
+
+  # Server access logs for the input and output buckets. Log delivery supports
+  # only SSE-S3 encryption on the destination bucket, not SSE-KMS.
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: This is the access-log destination bucket; logging it to itself would recurse.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: This is the access-log destination bucket; logging it to itself would recurse.
+          - id: W41
+            reason: S3 server access log delivery supports only SSE-S3 (AES256) on the destination bucket.
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-access-logs-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+      Tags:
+        - Key: Project
+          Value: CriminalChargeClassifier
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn':
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-input-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-output-${AWS::AccountId}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # Deny any non-TLS access to the buckets holding sensitive charge data.
+  InputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt InputBucket.Arn
+              - !Sub '${InputBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt OutputBucket.Arn
+              - !Sub '${OutputBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # CloudWatch Log Groups with retention
+  SplitterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SplitterFunction}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      # Native PII masking at ingest. Any PII that reaches the logs is masked at
+      # all egress points; only logs:Unmask can view raw. Defense-in-depth on top
+      # of app-level charge_id-only logging. Identifier list is authored once
+      # (&piiIds) and shared with the processor log group.
+      DataProtectionPolicy:
+        Name: !Sub '${AWS::StackName}-splitter-pii'
+        Version: '2021-06-01'
+        Statement:
+          - Sid: audit
+            DataIdentifier: &piiIds
+              - arn:aws:dataprotection::aws:data-identifier/Name
+              - arn:aws:dataprotection::aws:data-identifier/Address
+              - arn:aws:dataprotection::aws:data-identifier/DateOfBirth
+              - arn:aws:dataprotection::aws:data-identifier/DriversLicense-US
+              - arn:aws:dataprotection::aws:data-identifier/Ssn-US
+            Operation:
+              Audit:
+                FindingsDestination: {}
+          - Sid: mask
+            DataIdentifier: *piiIds
+            Operation:
+              Deidentify:
+                MaskConfig: {}
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProcessorFunction}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      # Native PII masking at ingest (see SplitterLogGroup).
+      DataProtectionPolicy:
+        Name: !Sub '${AWS::StackName}-processor-pii'
+        Version: '2021-06-01'
+        Statement:
+          - Sid: audit
+            DataIdentifier: *piiIds
+            Operation:
+              Audit:
+                FindingsDestination: {}
+          - Sid: mask
+            DataIdentifier: *piiIds
+            Operation:
+              Deidentify:
+                MaskConfig: {}
+
+  # CloudWatch Alarms
+  ProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-processor-errors'
+      AlarmDescription: Alert when processor Lambda has high error rate
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+
+  # Optional monthly cost budget. Alerts at 80% and 100%
+  # of the monthly budget so runaway Bedrock spend is caught early.
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-monthly-cost'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyCostBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-messages'
+      AlarmDescription: Alert when messages appear in dead letter queue
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+
+Outputs:
+  GuardrailId:
+    Description: Bedrock Guardrail ID (set as GUARDRAIL_ID for local runs)
+    Value: !GetAtt ChargeGuardrail.GuardrailId
+
+  GuardrailVersion:
+    Description: Bedrock Guardrail version (set as GUARDRAIL_VERSION for local runs)
+    Value: !GetAtt ChargeGuardrailVersion.Version
+
+  AccessLogsBucketName:
+    Description: S3 server access log bucket for the input and output buckets
+    Value: !Ref AccessLogsBucket
+
+  InputBucketName:
+    Description: S3 bucket for CSV uploads
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+  
+  OutputBucketName:
+    Description: S3 bucket for results
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+  
+  QueueUrl:
+    Description: SQS queue URL
+    Value: !Ref ChargeQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-QueueUrl'
+  
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref ResultsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+  
+  ProcessorFunctionArn:
+    Description: Processor Lambda ARN
+    Value: !GetAtt ProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorArn'
+  
+  WebSearchGatewayUrl:
+    Description: AgentCore Gateway URL for web search (set as WEB_SEARCH_GATEWAY_URL for local runs)
+    Value: !GetAtt WebSearchGateway.GatewayUrl
+  
+  EncryptionKeyArn:
+    Description: KMS encryption key ARN
+    Value: !GetAtt EncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptionKey'

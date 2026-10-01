@@ -1,0 +1,10 @@
+# DO NOT INSTALL THIS FILE DIRECTLY. It lists direct dependencies with version
+# ranges and is the input to the lock file. Install the pinned requirements-dev.txt instead,
+# which pins every package, including transitive ones. To change dependencies,
+# edit this file and regenerate the lock (README, "Update dependencies").
+pytest==9.1.1
+moto[s3,sqs,dynamodb]==5.2.3
+pandas==2.2.3
+pydantic==2.13.5
+boto3==1.43.106
+opentelemetry-api==1.45.0
