@@ -29,12 +29,12 @@ botocore==1.43.106
     #   strands-agents
 cachetools==6.2.4
     # via aws-opentelemetry-distro
-certifi==2026.7.22
+certifi==2026.10.18
     # via
     #   httpcore
     #   httpx
     #   requests
-cffi==2.1.1 ; platform_python_implementation != 'PyPy'
+cffi==2.1.1
     # via cryptography
 charset-normalizer==3.5.2
     # via requests
@@ -427,7 +427,7 @@ psutil==7.2.2
     # via opentelemetry-instrumentation-system-metrics
 pyarrow==25.0.1
     # via streamlit
-pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+pycparser==3.0
     # via cffi
 pydantic==2.13.5
     # via
@@ -441,7 +441,7 @@ pydantic-settings==2.15.0
     # via mcp
 pydeck==0.9.3
     # via streamlit
-pyjwt==2.15.1
+pyjwt[crypto]==2.15.1
     # via mcp
 python-dateutil==2.9.0.post0
     # via
@@ -456,8 +456,6 @@ python-multipart==0.0.32
     #   streamlit
 pytz==2026.4
     # via pandas
-pywin32==312 ; sys_platform == 'win32'
-    # via mcp
 pyyaml==6.0.3
     # via aws-opentelemetry-distro
 referencing==0.37.0
@@ -483,7 +481,7 @@ starlette==1.7.0
     #   mcp
     #   sse-starlette
     #   streamlit
-strands-agents==1.20.0
+strands-agents[otel]==1.20.0
     # via -r lambda_functions/requirements.in
 streamlit==1.64.0
     # via -r requirements.in
@@ -504,8 +502,6 @@ typing-extensions==4.16.0
     #   opentelemetry-semantic-conventions
     #   pydantic
     #   pydantic-core
-    #   referencing
-    #   starlette
     #   strands-agents
     #   streamlit
     #   typing-inspection
