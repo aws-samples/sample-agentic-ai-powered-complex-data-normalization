@@ -14,10 +14,10 @@ attrs==26.1.0
     #   jsonschema
     #   referencing
 aws-opentelemetry-distro==0.20.0
-    # via -r lambda_functions/requirements.in
+    # via -r requirements.in
 boto3==1.43.106
     # via
-    #   -r lambda_functions/requirements.in
+    #   -r requirements.in
     #   strands-agents
 botocore==1.43.106
     # via
@@ -389,7 +389,7 @@ packaging==26.3
     #   opentelemetry-instrumentation-pika
     #   opentelemetry-instrumentation-sqlalchemy
 pandas==2.2.3
-    # via -r lambda_functions/requirements.in
+    # via -r requirements.in
 protobuf==6.33.5
     # via
     #   aws-opentelemetry-distro
@@ -401,7 +401,7 @@ pycparser==3.0
     # via cffi
 pydantic==2.13.5
     # via
-    #   -r lambda_functions/requirements.in
+    #   -r requirements.in
     #   mcp
     #   pydantic-settings
     #   strands-agents
@@ -409,7 +409,7 @@ pydantic-core==2.46.5
     # via pydantic
 pydantic-settings==2.15.0
     # via mcp
-pyjwt==2.15.1
+pyjwt[crypto]==2.15.1
     # via mcp
 python-dateutil==2.9.0.post0
     # via
@@ -423,7 +423,9 @@ python-multipart==0.0.32
 pytz==2026.4
     # via pandas
 pyyaml==6.0.3
-    # via aws-opentelemetry-distro
+    # via
+    #   aws-opentelemetry-distro
+    #   strands-agents
 referencing==0.37.0
     # via
     #   jsonschema
@@ -444,8 +446,8 @@ starlette==1.7.0
     # via
     #   mcp
     #   sse-starlette
-strands-agents==1.20.0
-    # via -r lambda_functions/requirements.in
+strands-agents[otel]==1.48.0
+    # via -r requirements.in
 typing-extensions==4.16.0
     # via
     #   anyio
@@ -460,8 +462,6 @@ typing-extensions==4.16.0
     #   opentelemetry-semantic-conventions
     #   pydantic
     #   pydantic-core
-    #   referencing
-    #   starlette
     #   strands-agents
     #   typing-inspection
 typing-inspection==0.4.4
